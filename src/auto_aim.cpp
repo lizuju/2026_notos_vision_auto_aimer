@@ -5,7 +5,9 @@
 #include <opencv2/opencv.hpp>
 #include "tasks/auto_aim/solver.hpp"
 #include "io/camera.hpp"
-#include "io/gimbal/simple_gimbal.hpp"  
+#include "io/gimbal/simple_gimbal.hpp"
+#include "io/simple_serial.hpp"
+#include "tasks/auto_aim/aim_filter.hpp"  
 #include "io/command.hpp"
 
 #ifdef HAS_ROS2
@@ -37,31 +39,6 @@
 
 using namespace std::chrono_literals;
 
-// CRC16 Modbus 校验函数
-uint16_t crc16_modbus(const uint8_t *data, size_t length) {
-  uint16_t crc = 0xFFFF;
-  for (size_t i = 0; i < length; i++) {
-    crc ^= data[i];
-    for (int j = 0; j < 8; j++) {
-      if (crc & 0x0001) {
-        crc = (crc >> 1) ^ 0xA001;
-      } else {
-        crc = crc >> 1;
-      }
-    }
-  }
-  return crc;
-}
-
-// Simple Serial 状态结构体（用于接收下位机的 pitch/yaw/roll）
-struct SimpleSerialState {
-  std::mutex m;
-  double pitch_deg = 0.0;
-  double yaw_deg = 0.0;
-  double roll_deg = 0.0;
-  double ts = 0.0;
-  bool valid = false;
-};
 
 const std::string keys =
   "{help h usage ? |                     | 输出命令行参数说明}"
@@ -111,14 +88,8 @@ int main(int argc, char * argv[])
   std::unique_ptr<auto_aim::Planner> planner;
   std::unique_ptr<io::Gimbal> gimbal;
   std::unique_ptr<io::SimpleGimbal> simple_gimbal;
-  int simple_serial_fd = -1;
-  std::string serial_buffer;
-  float received_yaw = 0.0f;
-  float received_pitch = 0.0f;
-  // Simple serial shared state and control thread
-  std::shared_ptr<SimpleSerialState> simple_state = nullptr;
-  std::shared_ptr<std::atomic<bool>> simple_running = nullptr;
-  std::shared_ptr<std::thread> simple_thread = nullptr;
+  std::unique_ptr<io::SimpleSerial> simple_serial_inst;
+  std::shared_ptr<io::SimpleSerialState> simple_state = nullptr;
   bool use_mpc = false;
   bool use_serial = false;
   bool simple_serial = false;
@@ -184,123 +155,8 @@ int main(int argc, char * argv[])
     } else if (simple_serial) {
       tools::logger()->info("Step 6: Initializing Simple Serial (String format with CRC16)...");
       std::string com_port = cfg["com_port"] ? cfg["com_port"].as<std::string>() : "/dev/ttyUSB0";
-      simple_serial_fd = open(com_port.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
-      if (simple_serial_fd == -1) {
-        tools::logger()->error("Failed to open serial port: {}", com_port);
-        throw std::runtime_error("Serial port open failed");
-      }
-      struct termios options;
-      tcgetattr(simple_serial_fd, &options);
-      cfsetispeed(&options, B115200);
-      cfsetospeed(&options, B115200);
-      options.c_cflag &= ~PARENB;
-      options.c_cflag &= ~CSTOPB;
-      options.c_cflag &= ~CSIZE;
-      options.c_cflag |= CS8;
-      options.c_cflag |= CREAD | CLOCAL;
-      options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-      options.c_oflag &= ~OPOST;
-      options.c_iflag &= ~(IXON | IXOFF | IXANY);
-      tcsetattr(simple_serial_fd, TCSANOW, &options);
-      tools::logger()->info("Simple serial opened on {} (fd={})", com_port, simple_serial_fd);
-      std::cout << "[串口调试] 打开串口 fd=" << simple_serial_fd << std::endl;
-
-      // 启动简单串口接收线程：解析格式类似 "ARP%.2fY%.2fR%.2fC%04X%" 并带 CRC16
-      simple_state = std::make_shared<SimpleSerialState>();
-      simple_running = std::make_shared<std::atomic<bool>>(true);
-      simple_thread = std::make_shared<std::thread>([simple_serial_fd, simple_state, simple_running]() {
-        std::string buf;
-        buf.reserve(1024);
-        char rbuf[256];
-        // 更严格的帧正则：必须以ARP开头，后跟数字和小数点、负号，然后是C和4位16进制CRC
-        // 格式：ARP<pitch>Y<yaw>R<roll>C<CRC>%
-        static const std::regex frame_re(R"(ARP[-+]?\d+\.?\d*Y[-+]?\d+\.?\d*R[-+]?\d+\.?\d*C([0-9A-Fa-f]{4})%?)");
-        static const std::regex num_re(R"([-+]?\d+(?:\.\d+)?)");
-        while (simple_running->load()) {
-          ssize_t n = read(simple_serial_fd, rbuf, sizeof(rbuf));
-          if (n > 0) {
-            buf.append(rbuf, rbuf + n);
-            
-            // 防止缓冲区无限增长，保留最近的2KB数据
-            if (buf.size() > 2048) {
-              buf.erase(0, buf.size() - 1024);
-              tools::logger()->warn("[SimpleSerial RX] Buffer overflow, cleared old data");
-            }
-            
-            size_t pos;
-            while ((pos = buf.find('\n')) != std::string::npos) {
-              std::string line = buf.substr(0, pos);
-              buf.erase(0, pos + 1);
-              // trim ending whitespace
-              while (!line.empty() && isspace((unsigned char)line.back())) line.pop_back();
-              if (line.empty()) continue;
-
-              // 只处理包含"ARP"的行（下位机发送的姿态数据）
-              size_t arp_pos = line.find("ARP");
-              if (arp_pos == std::string::npos) {
-                continue;
-              }
-
-              // 从"ARP"位置开始截取，避免前面的垃圾数据干扰
-              std::string clean_line = line.substr(arp_pos);
-              
-              std::smatch match;
-              if (std::regex_match(clean_line, match, frame_re)) {  // 使用match而不是search
-                // 提取完整匹配的帧
-                std::string frame = match[0].str();
-                std::string crc_hex = match[1].str();
-                
-                // 找到'C'的位置，之前的是payload
-                size_t c_pos = frame.find('C');
-                if (c_pos == std::string::npos) continue;
-                
-                std::string payload = frame.substr(0, c_pos);
-                
-                uint16_t recv_crc = static_cast<uint16_t>(strtol(crc_hex.c_str(), nullptr, 16));
-                uint16_t calc_crc = crc16_modbus(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
-                
-                if (recv_crc != calc_crc) {
-                  tools::logger()->warn("[SimpleSerial RX] CRC mismatch: recv=0x{:04x}, calc=0x{:04x}, frame='{}'",
-                                        recv_crc, calc_crc, frame);
-                  continue;
-                }
-
-                // 从 payload 中提取3个数字（pitch, yaw, roll）
-                std::sregex_iterator it(payload.begin(), payload.end(), num_re), end;
-                std::vector<double> nums;
-                for (; it != end && nums.size() < 3; ++it) {
-                  try { nums.push_back(std::stod(it->str())); } catch (...) {}
-                }
-                if (nums.size() >= 3) {
-                  double pitch_deg = nums[0];
-                  double yaw_deg = nums[1];
-                  double roll_deg = nums[2];
-                  {
-                    std::lock_guard<std::mutex> lk(simple_state->m);
-                    simple_state->pitch_deg = pitch_deg;
-                    simple_state->yaw_deg = yaw_deg;
-                    simple_state->roll_deg = roll_deg;
-                    simple_state->ts = (double)std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    simple_state->valid = true;
-                  }
-                  tools::logger()->info("[SimpleSerial RX] pitch={:.2f}°, yaw={:.2f}°, roll={:.2f}°",
-                                        pitch_deg, yaw_deg, roll_deg);
-                } else {
-                  tools::logger()->warn("[SimpleSerial RX] frame parsed but not enough numbers: '{}', found {} nums", 
-                                        frame, nums.size());
-                }
-              } else {
-                // 正则不匹配，可能是格式错误或噪声数据
-                if (line.size() < 100) {  // 只对短行输出警告，避免刷屏
-                  tools::logger()->debug("[SimpleSerial RX] Invalid frame format: '{}'", line);
-                }
-              }
-            }
-          } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-          }
-        }
-      });
+      simple_serial_inst = std::make_unique<io::SimpleSerial>(com_port);
+      simple_state = simple_serial_inst->get_state();
     } else {
       tools::logger()->info("Step 6: Serial disabled, will output to console");
     }
@@ -332,22 +188,8 @@ int main(int argc, char * argv[])
     int frame_count = 0;
     double last_t = -1; // 定义 last_t
     
-    // 第一层：低通滤波器（快速响应）
-    double filtered_pitch = 0.0;
-    double filtered_yaw = 0.0;
-    constexpr double FILTER_ALPHA = 0.3;  // 滤波系数，越小越平滑但响应越慢
-    constexpr double DEADZONE_DEG = 0.05;  // 死区阈值（度），小于此值不更新指令
-    
-    // 第二层：移动平均滤波器（平滑高速运动）
-    constexpr int MA_WINDOW_SIZE = 5;  // 移动平均窗口大小（帧数）
-    std::deque<double> pitch_history;  // pitch历史队列
-    std::deque<double> yaw_history;    // yaw历史队列
-    
-    // 第三层：自适应滤波系数（根据目标速度调整）
-    constexpr double MIN_ALPHA = 0.2;   // 低速时的滤波系数（更平滑）
-    constexpr double MAX_ALPHA = 0.6;   // 高速时的滤波系数（更快响应）
-    constexpr double SPEED_THRESHOLD_LOW = 1.0;   // 低速阈值 (m/s)
-    constexpr double SPEED_THRESHOLD_HIGH = 3.0;  // 高速阈值 (m/s)
+    // 初始化滤波器
+    auto_aim::AimFilter aim_filter;
 
     // 开火判断：连续稳定帧计数
     int stable_aim_frames = 0;
@@ -556,32 +398,14 @@ int main(int argc, char * argv[])
             plan.yaw, plan.yaw_vel, plan.yaw_acc,
             plan.pitch, plan.pitch_vel, plan.pitch_acc
           );
-        } else if (simple_serial && simple_serial_fd >= 0) {
-          // 简单模式：字符串格式发送位置和开火标志（AAP%.2fY%.2fF%dN%d + CRC16）
-          // 无目标时发送心跳包（pitch=0, yaw=0, fire=0）
-          char frame[64];
+        } else if (simple_serial && simple_serial_inst && simple_serial_inst->is_open()) {
           float send_pitch = plan.control ? plan.pitch * 57.3 : 0.0f;
           float send_yaw = plan.control ? plan.yaw * 57.3 : 0.0f;
           int send_fire = plan.control && plan.fire ? 1 : 0;
-          
-          // 1. 格式化数据部分（字符串）
-          int len = snprintf(frame, sizeof(frame), "AAP%.2fY%.2fF%dN%d", 
-                            send_pitch, send_yaw, send_fire, current_frame_count);
-          
-          // 2. 计算 CRC16
-          uint16_t crc = crc16_modbus((uint8_t *)frame, len);
-          
-          // 3. 拼接 CRC16 和帧尾
-          len += snprintf(frame + len, sizeof(frame) - len, "C%04x%%\n", crc);
-          
-          // 4. 发送数据
-          int written = write(simple_serial_fd, frame, len);
-          if (written != len) {
-            tools::logger()->warn("Serial write incomplete: {}/{}", written, len);
-          } else if (current_frame_count % 30 == 0) {
+          simple_serial_inst->send_command(send_pitch, send_yaw, send_fire, current_frame_count);
+          if (current_frame_count % 30 == 0) {
             std::cout << fmt::format(
-              "[Simple Serial] 发送: {} (Pitch: {:.2f}°, Yaw: {:.2f}°, Fire: {}, Frame: {}, Control: {})\n",
-              std::string(frame, len - 1),
+              "[Simple Serial] 发送 (Pitch: {:.2f}°, Yaw: {:.2f}°, Fire: {}, Frame: {}, Control: {})\n",
               send_pitch, send_yaw, send_fire, current_frame_count, plan.control
             );
           }
@@ -606,98 +430,14 @@ int main(int argc, char * argv[])
 
         // 应用三层滤波处理，减少静止和高速移动时的指令抖动
         if (command.control) {
-          double raw_pitch_deg = command.pitch * 57.3;
-          double raw_yaw_deg = command.yaw * 57.3;
-          
-          // 初始化滤波器（第一帧）
-          if (frame_count == 1) {
-            filtered_pitch = raw_pitch_deg;
-            filtered_yaw = raw_yaw_deg;
-            pitch_history.clear();
-            yaw_history.clear();
-          }
-          
-          // === 第一层滤波：自适应低通滤波 ===
-          // 根据目标速度动态调整滤波系数
           double target_speed = 0.0;
           if (!targets.empty()) {
             auto& target = targets.front();
             Eigen::VectorXd x = target.ekf_x();
-            // 计算3D速度 sqrt(vx^2 + vy^2 + vz^2)
             double vx = x[1], vy = x[3], vz = x[5];
             target_speed = std::sqrt(vx*vx + vy*vy + vz*vz);
           }
-          
-          // 线性插值计算自适应滤波系数
-          double adaptive_alpha = FILTER_ALPHA;
-          if (target_speed < SPEED_THRESHOLD_LOW) {
-            adaptive_alpha = MIN_ALPHA;  // 低速：更平滑
-          } else if (target_speed > SPEED_THRESHOLD_HIGH) {
-            adaptive_alpha = MAX_ALPHA;  // 高速：更快响应
-          } else {
-            // 中速：线性插值
-            double ratio = (target_speed - SPEED_THRESHOLD_LOW) / (SPEED_THRESHOLD_HIGH - SPEED_THRESHOLD_LOW);
-            adaptive_alpha = MIN_ALPHA + ratio * (MAX_ALPHA - MIN_ALPHA);
-          }
-          
-          // 应用自适应低通滤波
-          filtered_pitch = adaptive_alpha * raw_pitch_deg + (1.0 - adaptive_alpha) * filtered_pitch;
-          filtered_yaw = adaptive_alpha * raw_yaw_deg + (1.0 - adaptive_alpha) * filtered_yaw;
-          
-          // === 第二层滤波：移动平均滤波 ===
-          // 添加当前值到历史队列
-          pitch_history.push_back(filtered_pitch);
-          yaw_history.push_back(filtered_yaw);
-          
-          // 保持队列长度不超过窗口大小
-          if (pitch_history.size() > MA_WINDOW_SIZE) {
-            pitch_history.pop_front();
-          }
-          if (yaw_history.size() > MA_WINDOW_SIZE) {
-            yaw_history.pop_front();
-          }
-          
-          // 计算加权移动平均（近期权重更大）
-          double ma_pitch = 0.0, ma_yaw = 0.0;
-          double weight_sum = 0.0;
-          for (size_t i = 0; i < pitch_history.size(); ++i) {
-            double weight = i + 1;  // 线性权重：1, 2, 3, 4, 5
-            ma_pitch += pitch_history[i] * weight;
-            ma_yaw += yaw_history[i] * weight;
-            weight_sum += weight;
-          }
-          if (weight_sum > 0) {
-            ma_pitch /= weight_sum;
-            ma_yaw /= weight_sum;
-          }
-          
-          // === 第三层：死区处理 ===
-          // 如果变化量小于阈值，保持上一次的值
-          double delta_pitch = std::abs(ma_pitch - (last_command.pitch * 57.3));
-          double delta_yaw = std::abs(ma_yaw - (last_command.yaw * 57.3));
-          
-          if (delta_pitch < DEADZONE_DEG && delta_yaw < DEADZONE_DEG && last_command.control) {
-            // 在死区内，使用上一次的指令
-            command.pitch = last_command.pitch;
-            command.yaw = last_command.yaw;
-          } else {
-            // 超出死区，使用滤波后的新指令
-            command.pitch = ma_pitch / 57.3;
-            command.yaw = ma_yaw / 57.3;
-          }
-          
-          // 调试输出滤波信息（可选，根据需要注释）
-          if (frame_count % 30 == 0) {  // 每30帧输出一次
-            tools::logger()->debug(
-              "[滤波调试] 速度={:.2f}m/s, alpha={:.2f}, 原始P={:.2f}° Y={:.2f}°, "
-              "低通P={:.2f}° Y={:.2f}°, 移动平均P={:.2f}° Y={:.2f}°, 最终P={:.2f}° Y={:.2f}°",
-              target_speed, adaptive_alpha,
-              raw_pitch_deg, raw_yaw_deg,
-              filtered_pitch, filtered_yaw,
-              ma_pitch, ma_yaw,
-              command.pitch * 57.3, command.yaw * 57.3
-            );
-          }
+          aim_filter.filter(command.pitch * 57.3, command.yaw * 57.3, target_speed, last_command, command, frame_count);
         }
 
         // 保存控制指令到变量
@@ -732,58 +472,29 @@ int main(int argc, char * argv[])
             command.yaw, 0.0f, 0.0f,
             command.pitch, 0.0f, 0.0f
           );
-        } else if (simple_serial && simple_serial_fd >= 0) {
-          // 简单串口模式：发送pitch、yaw、fire（AAP%.2fY%.2fF%dN%d + CRC16）
-          // 下位机期望相对于当前云台姿态的增量角度，所以需要减去当前云台角度
-          char frame[64];
-          // 从四元数提取当前云台的yaw和pitch（弧度）
+        } else if (simple_serial && simple_serial_inst && simple_serial_inst->is_open()) {
           Eigen::Vector3d current_euler = gimbal_q.toRotationMatrix().eulerAngles(2, 1, 0);
           float current_yaw_rad = current_euler[0];
           float current_pitch_rad = current_euler[1];
-          
-          // 计算增量角度（目标角度 - 当前角度），转为度
           float send_pitch = command.control ? (command.pitch - current_pitch_rad) * 57.3 : 0.0f;
           float send_yaw = command.control ? (command.yaw - current_yaw_rad) * 57.3 : 0.0f;
           
-          // 改进的开火判断：检查增量角度的绝对精度（云台是否真的瞄准了）
-          // 而不是只检查指令稳定性
-          constexpr double AIM_PRECISION_THRESH = 1.0;  // 增量角度阈值：1度以内才允许开火
-          double aim_error = std::hypot(send_pitch, send_yaw);  // 计算增量角度的综合误差
-          
-          bool aim_precise = (aim_error < AIM_PRECISION_THRESH);  // 检查是否精确瞄准
-          
-          // 只有同时满足：1) 控制有效 2) 允许射击 3) 瞄准精度足够 才开火
+          constexpr double AIM_PRECISION_THRESH = 1.0;
+          double aim_error = std::hypot(send_pitch, send_yaw);
+          bool aim_precise = (aim_error < AIM_PRECISION_THRESH);
           int send_fire = command.control && command.shoot && aim_precise ? 1 : 0;
           
-          // 调试输出瞄准精度
           if (command.control && frame_count % 30 == 0) {
             tools::logger()->info(
               "[瞄准精度] 增量P={:.2f}°, Y={:.2f}°, 总误差={:.2f}°, 阈值={:.2f}°, 精确={}, 允许开火={}",
               send_pitch, send_yaw, aim_error, AIM_PRECISION_THRESH, aim_precise, send_fire
             );
           }
-          
-          // 1. 格式化数据部分（字符串）
-          int len = snprintf(frame, sizeof(frame), "AAP%.2fY%.2fF%dN%d", 
-                            send_pitch, send_yaw, send_fire, current_frame_count);
-          
-          // 2. 计算 CRC16
-          uint16_t crc = crc16_modbus((uint8_t *)frame, len);
-          
-          // 3. 拼接 CRC16 和帧尾
-          len += snprintf(frame + len, sizeof(frame) - len, "C%04x%%\n", crc);
-          
-          // 4. 发送数据
-          int written = write(simple_serial_fd, frame, len);
-          if (written != len) {
-            tools::logger()->warn("Serial write incomplete: {}/{}", written, len);
-          } else if (current_frame_count % 30 == 0) {
+          simple_serial_inst->send_command(send_pitch, send_yaw, send_fire, current_frame_count);
+          if (current_frame_count % 30 == 0) {
             std::cout << fmt::format(
-              "[Aimer Simple Serial] 发送: {} (增量 Pitch: {:.2f}°, Yaw: {:.2f}°, Fire: {}, Frame: {}, Control: {}) [绝对目标: P={:.2f}° Y={:.2f}°, 当前云台: P={:.2f}° Y={:.2f}°]\n",
-              std::string(frame, len - 1),
-              send_pitch, send_yaw, send_fire, current_frame_count, command.control,
-              command.pitch * 57.3, command.yaw * 57.3,
-              current_pitch_rad * 57.3, current_yaw_rad * 57.3
+              "[Aimer Simple Serial] 发送 (增量 Pitch: {:.2f}°, Yaw: {:.2f}°, Fire: {}, Frame: {}, Control: {})\n",
+              send_pitch, send_yaw, send_fire, current_frame_count, command.control
             );
           }
         } else if (command.control) {
@@ -941,17 +652,8 @@ int main(int argc, char * argv[])
       }
     }  // end of while
 
-    // 停止并关闭简单串口接收线程（如已启动）
-    try {
-      if (simple_running) simple_running->store(false);
-      if (simple_thread && simple_thread->joinable()) simple_thread->join();
-    } catch (...) {}
+    // Simple Serial will auto cleanup via smart pointer.
 
-    // 关闭简单串口描述符
-    if (simple_serial_fd >= 0) {
-      close(simple_serial_fd);
-      tools::logger()->info("Simple serial port closed");
-    }
 
   } catch (const YAML::Exception& e) {
     std::cerr << "YAML Exception: " << e.what() << std::endl;

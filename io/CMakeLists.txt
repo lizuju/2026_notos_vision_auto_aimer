@@ -14,6 +14,7 @@ add_library(io STATIC
     dm_imu/dm_imu.cpp
     gimbal/gimbal.cpp
     gimbal/simple_gimbal.cpp
+    simple_serial.cpp
 )
 
 # hikrobot

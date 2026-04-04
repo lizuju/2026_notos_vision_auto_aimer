@@ -12,6 +12,7 @@ add_library(task_auto_aim STATIC
     detector.cpp
     solver.cpp
     aimer.cpp
+    aim_filter.cpp
     target.cpp
     tracker.cpp
     voter.cpp
